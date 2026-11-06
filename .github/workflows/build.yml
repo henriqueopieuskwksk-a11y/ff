@@ -1,0 +1,797 @@
+name: build
+on: [push, workflow_dispatch]
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: toolchain
+        run: yes | sdkmanager "ndk;28.2.13676358" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: escrever projeto
+        run: |
+          set -e
+          mkdir -p app/src/main/java/com/venice/ffmenu app/src/main/cpp
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "FFMenu"
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.1.4' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=false
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+
+          android {
+              namespace 'com.venice.ffmenu'
+              compileSdk 34
+              ndkVersion "28.2.13676358"
+
+              defaultConfig {
+                  applicationId "com.venice.ffmenu"
+                  minSdk 24
+                  targetSdk 33
+                  versionCode 1
+                  versionName "1.0"
+                  ndk { abiFilters 'arm64-v8a' }
+                  externalNativeBuild {
+                      cmake { cppFlags '-std=c++17 -O2' }
+                  }
+              }
+
+              externalNativeBuild {
+                  cmake {
+                      path file('src/main/cpp/CMakeLists.txt')
+                      version '3.22.1'
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              buildTypes {
+                  debug { minifyEnabled false }
+                  release {
+                      minifyEnabled false
+                      signingConfig signingConfigs.debug
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+
+              <application
+                  android:allowBackup="false"
+                  android:label="FF Safe ESP"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+
+                  <service android:name=".MenuService" android:exported="false"/>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/venice/ffmenu/Native.java <<'EOF'
+          package com.venice.ffmenu;
+
+          public final class Native {
+              static { System.loadLibrary("ffmenu"); }
+
+              public static native long open(int pid);
+              public static native void close();
+              public static native float[] esp(int flags, int w, int h);
+          }
+          EOF
+
+          cat > app/src/main/java/com/venice/ffmenu/Config.java <<'EOF'
+          package com.venice.ffmenu;
+
+          public final class Config {
+              public static volatile boolean box = true;
+              public static volatile boolean health = true;
+              public static volatile boolean line = true;
+
+              public static int flags() {
+                  return (box ? 1 : 0) | (health ? 2 : 0) | (line ? 4 : 0);
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/venice/ffmenu/Shell.java <<'EOF'
+          package com.venice.ffmenu;
+
+          import java.io.BufferedReader;
+          import java.io.InputStreamReader;
+
+          public final class Shell {
+
+              public static String exec(String cmd) {
+                  StringBuilder sb = new StringBuilder();
+                  try {
+                      Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
+                      BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()));
+                      String l;
+                      while ((l = r.readLine()) != null) sb.append(l).append('\n');
+                      r.close();
+                      p.waitFor();
+                  } catch (Exception ignored) {}
+                  return sb.toString().trim();
+              }
+
+              public static boolean hasRoot() {
+                  return exec("id").contains("uid=0");
+              }
+
+              public static int findPid() {
+                  String out = exec("pidof com.dts.freefireth; pidof com.dts.freefiremax");
+                  for (String s : out.split("\\s+")) {
+                      try {
+                          int pid = Integer.parseInt(s.trim());
+                          if (pid > 0) return pid;
+                      } catch (Exception ignored) {}
+                  }
+                  return -1;
+              }
+
+              public static void allowAccess(int pid) {
+                  exec("chmod 644 /proc/" + pid + "/maps; chmod 666 /proc/" + pid + "/mem");
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/venice/ffmenu/EspView.java <<'EOF'
+          package com.venice.ffmenu;
+
+          import android.content.Context;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Paint;
+          import android.view.View;
+
+          public class EspView extends View implements Runnable {
+
+              private final Paint boxPaint = new Paint();
+              private final Paint hpPaint = new Paint();
+              private final Paint linePaint = new Paint();
+              private final Paint bgPaint = new Paint();
+
+              private volatile float[] data = null;
+              private volatile int pid = -1;
+              private volatile boolean running = true;
+              private Thread thread;
+
+              public EspView(Context c) {
+                  super(c);
+                  boxPaint.setStyle(Paint.Style.STROKE);
+                  boxPaint.setStrokeWidth(3f);
+                  boxPaint.setAntiAlias(true);
+                  hpPaint.setStyle(Paint.Style.FILL);
+                  linePaint.setStrokeWidth(2f);
+                  linePaint.setAntiAlias(true);
+                  bgPaint.setStyle(Paint.Style.FILL);
+                  bgPaint.setColor(0x66000000);
+                  setWillNotDraw(false);
+              }
+
+              @Override
+              protected void onAttachedToWindow() {
+                  super.onAttachedToWindow();
+                  running = true;
+                  thread = new Thread(this);
+                  thread.start();
+              }
+
+              @Override
+              protected void onDetachedFromWindow() {
+                  running = false;
+                  Native.close();
+                  super.onDetachedFromWindow();
+              }
+
+              @Override
+              public void run() {
+                  while (running) {
+                      try {
+                          if (pid > 0) data = Native.esp(Config.flags(), getWidth(), getHeight());
+                          postInvalidateOnAnimation();
+                          Thread.sleep(40);
+                      } catch (Exception ignored) {
+                          try { Thread.sleep(200); } catch (Exception e) {}
+                      }
+                  }
+              }
+
+              public void setPid(int p) {
+                  pid = p;
+                  if (p > 0) {
+                      Shell.allowAccess(p);
+                      Native.open(p);
+                  } else {
+                      Native.close();
+                  }
+              }
+
+              @Override
+              protected void onDraw(Canvas canvas) {
+                  float[] d = data;
+                  if (d == null || d.length < 1) return;
+
+                  int n = (int) d[0];
+                  int cx = getWidth() / 2;
+                  int cy = getHeight();
+
+                  for (int i = 0; i < n; i++) {
+                      int o = 1 + i * 8;
+                      if (o + 7 >= d.length) break;
+
+                      float l = d[o], t = d[o + 1], r = d[o + 2], b = d[o + 3];
+                      float hp = d[o + 4];
+                      float sx = d[o + 5], sy = d[o + 6];
+                      boolean enemy = d[o + 7] > 0.5f;
+
+                      int color = enemy ? Color.RED : Color.rgb(0, 220, 255);
+
+                      if (Config.box) {
+                          boxPaint.setColor(color);
+                          canvas.drawRect(l, t, r, b, boxPaint);
+                      }
+
+                      if (Config.health) {
+                          float barW = 5f;
+                          float left = l - barW - 4f;
+                          canvas.drawRect(left, t, left + barW, b, bgPaint);
+
+                          float h = b - t;
+                          int hc = hp > 0.6f ? Color.rgb(0, 255, 90)
+                                  : hp > 0.3f ? Color.YELLOW : Color.RED;
+                          hpPaint.setColor(hc);
+                          canvas.drawRect(left, b - h * hp, left + barW, b, hpPaint);
+                      }
+
+                      if (Config.line) {
+                          linePaint.setColor(color);
+                          canvas.drawLine(cx, cy, sx, sy, linePaint);
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/venice/ffmenu/MenuView.java <<'EOF'
+          package com.venice.ffmenu;
+
+          import android.annotation.SuppressLint;
+          import android.content.Context;
+          import android.graphics.Color;
+          import android.graphics.drawable.GradientDrawable;
+          import android.view.Gravity;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.Switch;
+          import android.widget.TextView;
+
+          public class MenuView extends LinearLayout {
+
+              private final Button icon;
+              private final LinearLayout panel;
+              private final TextView status;
+              private boolean expanded = false;
+
+              private float dx, dy;
+              private int px, py;
+
+              @SuppressLint("ClickableViewAccessibility")
+              public MenuView(Context c, EspView esp, Runnable onExit) {
+                  super(c);
+                  setOrientation(HORIZONTAL);
+                  setGravity(Gravity.CENTER_VERTICAL);
+
+                  icon = new Button(c);
+                  icon.setText("FF");
+                  icon.setTextSize(12);
+                  icon.setTextColor(Color.WHITE);
+                  GradientDrawable g = new GradientDrawable();
+                  g.setColor(0xFFE53935);
+                  g.setCornerRadius(40);
+                  icon.setBackground(g);
+                  LayoutParams ip = new LayoutParams(96, 96);
+                  addView(icon, ip);
+
+                  panel = new LinearLayout(c);
+                  panel.setOrientation(VERTICAL);
+                  panel.setPadding(24, 18, 24, 18);
+                  GradientDrawable pg = new GradientDrawable();
+                  pg.setColor(0xE6101010);
+                  pg.setCornerRadius(24);
+                  pg.setStroke(2, 0xFFE53935);
+                  panel.setBackground(pg);
+                  panel.setVisibility(GONE);
+
+                  status = new TextView(c);
+                  status.setText("aguardando FF...");
+                  status.setTextColor(0xFFFFC107);
+                  status.setTextSize(11);
+                  panel.addView(status);
+
+                  panel.addView(makeSwitch(c, "ESP Box", Config.box, v -> Config.box = v));
+                  panel.addView(makeSwitch(c, "ESP Life", Config.health, v -> Config.health = v));
+                  panel.addView(makeSwitch(c, "ESP Line", Config.line, v -> Config.line = v));
+
+                  Button exit = new Button(c);
+                  exit.setText("SAIR");
+                  exit.setTextSize(11);
+                  exit.setTextColor(Color.WHITE);
+                  GradientDrawable eg = new GradientDrawable();
+                  eg.setColor(0xFF212121);
+                  eg.setCornerRadius(20);
+                  exit.setBackground(eg);
+                  exit.setOnClickListener(v -> onExit.run());
+                  panel.addView(exit, new LayoutParams(LayoutParams.MATCH_PARENT, 90));
+
+                  LayoutParams pp = new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT);
+                  pp.leftMargin = 16;
+                  addView(panel, pp);
+
+                  icon.setOnClickListener(v -> {
+                      expanded = !expanded;
+                      panel.setVisibility(expanded ? VISIBLE : GONE);
+                  });
+
+                  setOnTouchListener(new OnTouchListener() {
+                      @Override
+                      public boolean onTouch(View v, MotionEvent e) {
+                          switch (e.getAction()) {
+                              case MotionEvent.ACTION_DOWN:
+                                  dx = e.getRawX(); dy = e.getRawY();
+                                  px = (int) getX(); py = (int) getY();
+                                  return false;
+                              case MotionEvent.ACTION_MOVE:
+                                  setX(px + (e.getRawX() - dx));
+                                  setY(py + (e.getRawY() - dy));
+                                  return false;
+                          }
+                          return false;
+                      }
+                  });
+              }
+
+              private interface OnToggle { void on(boolean v); }
+
+              private Switch makeSwitch(Context c, String label, boolean def, OnToggle cb) {
+                  Switch s = new Switch(c);
+                  s.setText(label);
+                  s.setTextColor(Color.WHITE);
+                  s.setTextSize(12);
+                  s.setChecked(def);
+                  s.setOnCheckedChangeListener((b, v) -> cb.on(v));
+                  return s;
+              }
+
+              public void setStatus(String s) {
+                  post(() -> status.setText(s));
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/venice/ffmenu/MenuService.java <<'EOF'
+          package com.venice.ffmenu;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.graphics.PixelFormat;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.IBinder;
+          import android.os.Looper;
+          import android.view.Gravity;
+          import android.view.WindowManager;
+
+          public class MenuService extends Service implements Runnable {
+
+              private WindowManager wm;
+              private EspView esp;
+              private MenuView menu;
+              private final Handler h = new Handler(Looper.getMainLooper());
+              private boolean alive = true;
+
+              @Override
+              public void onCreate() {
+                  super.onCreate();
+
+                  String ch = "ffmenu";
+                  NotificationManager nm = getSystemService(NotificationManager.class);
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nm.createNotificationChannel(new NotificationChannel(ch, "FF Menu",
+                              NotificationManager.IMPORTANCE_LOW));
+                  }
+                  Notification n = (Build.VERSION.SDK_INT >= 26
+                          ? new Notification.Builder(this, ch)
+                          : new Notification.Builder(this))
+                          .setContentTitle("FF Safe ESP")
+                          .setContentText("menu ativo")
+                          .setSmallIcon(android.R.drawable.ic_menu_view)
+                          .build();
+                  startForeground(1, n);
+
+                  wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+
+                  int espFlags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                          | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                          | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                          | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS;
+
+                  WindowManager.LayoutParams elp = new WindowManager.LayoutParams(
+                          WindowManager.LayoutParams.MATCH_PARENT,
+                          WindowManager.LayoutParams.MATCH_PARENT,
+                          WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                          espFlags,
+                          PixelFormat.TRANSLUCENT);
+
+                  esp = new EspView(this);
+                  wm.addView(esp, elp);
+
+                  WindowManager.LayoutParams mlp = new WindowManager.LayoutParams(
+                          WindowManager.LayoutParams.WRAP_CONTENT,
+                          WindowManager.LayoutParams.WRAP_CONTENT,
+                          WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                          PixelFormat.TRANSLUCENT);
+                  mlp.gravity = Gravity.TOP | Gravity.START;
+                  mlp.x = 20;
+                  mlp.y = 200;
+
+                  menu = new MenuView(this, esp, this::stopSelf);
+                  wm.addView(menu, mlp);
+
+                  h.post(this);
+              }
+
+              @Override
+              public void run() {
+                  if (!alive) return;
+
+                  int pid = Shell.findPid();
+                  if (pid > 0) {
+                      esp.setPid(pid);
+                      menu.setStatus("conectado (pid " + pid + ")");
+                  } else {
+                      menu.setStatus("aguardando FF...");
+                  }
+                  h.postDelayed(this, 3000);
+              }
+
+              @Override
+              public void onDestroy() {
+                  alive = false;
+                  h.removeCallbacksAndMessages(null);
+                  try { if (esp != null) wm.removeView(esp); } catch (Exception ignored) {}
+                  try { if (menu != null) wm.removeView(menu); } catch (Exception ignored) {}
+                  Native.close();
+                  super.onDestroy();
+              }
+
+              @Override
+              public IBinder onBind(Intent i) { return null; }
+          }
+          EOF
+
+          cat > app/src/main/java/com/venice/ffmenu/MainActivity.java <<'EOF'
+          package com.venice.ffmenu;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.view.Gravity;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+
+          public class MainActivity extends Activity {
+
+              private TextView info;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setGravity(Gravity.CENTER);
+                  root.setBackgroundColor(0xFF0D0D0D);
+                  root.setPadding(48, 48, 48, 48);
+
+                  TextView title = new TextView(this);
+                  title.setText("FF SAFE ESP");
+                  title.setTextColor(Color.WHITE);
+                  title.setTextSize(26);
+                  root.addView(title);
+
+                  info = new TextView(this);
+                  info.setTextColor(0xFFAAAAAA);
+                  info.setTextSize(13);
+                  info.setPadding(0, 24, 0, 32);
+                  root.addView(info);
+
+                  root.addView(btn("1. Permissao de sobreposicao", v -> {
+                      startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                              Uri.parse("package:" + getPackageName())));
+                  }));
+
+                  root.addView(btn("2. Iniciar menu", v -> {
+                      if (!Settings.canDrawOverlays(this)) { refresh(); return; }
+                      if (!Shell.hasRoot()) { info.setText("ROOT nao encontrado."); return; }
+                      startService(new Intent(this, MenuService.class));
+                      info.setText("Menu ativo. Abra o Free Fire.");
+                  }));
+
+                  root.addView(btn("Parar menu", v -> stopService(new Intent(this, MenuService.class))));
+
+                  setContentView(root);
+              }
+
+              private Button btn(String txt, android.view.View.OnClickListener c) {
+                  Button b = new Button(this);
+                  b.setText(txt);
+                  b.setOnClickListener(c);
+                  LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+                  p.bottomMargin = 18;
+                  b.setLayoutParams(p);
+                  return b;
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  refresh();
+              }
+
+              private void refresh() {
+                  boolean ov = Settings.canDrawOverlays(this);
+                  boolean root = Shell.hasRoot();
+                  info.setText("Sobreposicao: " + (ov ? "OK" : "PENDENTE")
+                          + "\nRoot: " + (root ? "OK" : "AUSENTE"));
+              }
+          }
+          EOF
+
+          cat > app/src/main/cpp/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.22.1)
+          project(ffmenu)
+
+          add_library(ffmenu SHARED native-lib.cpp)
+          target_link_libraries(ffmenu log)
+          EOF
+
+          cat > app/src/main/cpp/native-lib.cpp <<'EOF'
+          #include <jni.h>
+          #include <cstdio>
+          #include <cstring>
+          #include <cstdint>
+          #include <cstdlib>
+          #include <vector>
+          #include <unistd.h>
+          #include <fcntl.h>
+          #include <sys/types.h>
+
+          /* ==================== OFFSETS (arm64) ==================== */
+          #define OFF_GAMEFACADE      0x9C1F4B8
+          #define OFF_MATCH           0x18
+          #define OFF_LOCALPLAYER     0x20
+          #define OFF_ENTITYDICT      0x28
+          #define OFF_CAMERA          0x34
+          #define OFF_VIEWMATRIX      0x2C
+          #define OFF_POS             0x50
+          #define OFF_HEALTH          0x6C
+          #define OFF_TEAM            0x64
+          #define OFF_DICT_ENTRIES    0x18
+          #define OFF_DICT_COUNT      0x20
+          #define ENTRY_SIZE          0x20
+          #define ENTRY_KEY           0x10
+          /* ======================================================== */
+
+          static int      g_mem  = -1;
+          static pid_t    g_pid  = 0;
+          static uint64_t g_base = 0;
+          static int      g_sw = 0, g_sh = 0;
+          static float    g_m[16];
+
+          static bool readMem(uint64_t addr, void* buf, size_t size) {
+              if (g_mem < 0) return false;
+              return pread64(g_mem, buf, size, (off64_t) addr) == (ssize_t) size;
+          }
+
+          template <class T> static T rd(uint64_t a) {
+              T v{};
+              readMem(a, &v, sizeof(T));
+              return v;
+          }
+
+          static uint64_t moduleBase(const char* name) {
+              char path[64];
+              snprintf(path, sizeof(path), "/proc/%d/maps", g_pid);
+              FILE* f = fopen(path, "r");
+              if (!f) return 0;
+
+              char line[512];
+              uint64_t base = 0;
+              while (fgets(line, sizeof(line), f)) {
+                  if (strstr(line, name)) {
+                      uint64_t s = 0, e = 0;
+                      if (sscanf(line, "%lx-%lx", &s, &e) == 2) { base = s; break; }
+                  }
+              }
+              fclose(f);
+              return base;
+          }
+
+          static bool w2s(float x, float y, float z, float& ox, float& oy) {
+              float vx = g_m[0]*x + g_m[4]*y + g_m[8]*z  + g_m[12];
+              float vy = g_m[1]*x + g_m[5]*y + g_m[9]*z  + g_m[13];
+              float vz = g_m[2]*x + g_m[6]*y + g_m[10]*z + g_m[14];
+              float vw = g_m[3]*x + g_m[7]*y + g_m[11]*z + g_m[15];
+              if (vw < 0.001f) return false;
+              float inv = 1.0f / vw;
+              vx *= inv; vy *= inv;
+              ox = (g_sw * 0.5f) * vx + (g_sw * 0.5f);
+              oy = -(g_sh * 0.5f) * vy + (g_sh * 0.5f);
+              return true;
+          }
+
+          static jfloatArray toArray(JNIEnv* env, std::vector<float>& v) {
+              jfloatArray a = env->NewFloatArray((jsize) v.size());
+              if (a) env->SetFloatArrayRegion(a, 0, (jsize) v.size(), v.data());
+              return a;
+          }
+
+          extern "C" JNIEXPORT jlong JNICALL
+          Java_com_venice_ffmenu_Native_open(JNIEnv*, jclass, jint pid) {
+              g_pid = (pid_t) pid;
+              g_base = 0;
+
+              if (g_mem >= 0) { close(g_mem); g_mem = -1; }
+              if (g_pid <= 0) return 0;
+
+              g_base = moduleBase("libil2cpp.so");
+              if (!g_base) return 0;
+
+              char path[64];
+              snprintf(path, sizeof(path), "/proc/%d/mem", g_pid);
+              g_mem = ::open(path, O_RDONLY);
+              if (g_mem < 0) { g_base = 0; return 0; }
+
+              return (jlong) g_base;
+          }
+
+          extern "C" JNIEXPORT void JNICALL
+          Java_com_venice_ffmenu_Native_close(JNIEnv*, jclass) {
+              if (g_mem >= 0) { close(g_mem); g_mem = -1; }
+              g_pid = 0; g_base = 0;
+          }
+
+          extern "C" JNIEXPORT jfloatArray JNICALL
+          Java_com_venice_ffmenu_Native_esp(JNIEnv* env, jclass, jint flags, jint sw, jint sh) {
+              g_sw = sw; g_sh = sh;
+              std::vector<float> out;
+              out.push_back(0.0f);
+
+              if (!g_base || g_mem < 0 || !sw || !sh) return toArray(env, out);
+
+              uint64_t facade = rd<uint64_t>(g_base + OFF_GAMEFACADE);
+              if (!facade) return toArray(env, out);
+
+              uint64_t match = rd<uint64_t>(facade + OFF_MATCH);
+              if (!match) return toArray(env, out);
+
+              uint64_t local = rd<uint64_t>(match + OFF_LOCALPLAYER);
+              if (!local) return toArray(env, out);
+
+              uint64_t cam = rd<uint64_t>(local + OFF_CAMERA);
+              if (!cam) return toArray(env, out);
+              for (int i = 0; i < 16; i++) g_m[i] = rd<float>(cam + OFF_VIEWMATRIX + i * 4);
+              if (g_m[0] == 0.0f && g_m[5] == 0.0f) return toArray(env, out);
+
+              int myTeam = rd<int32_t>(local + OFF_TEAM);
+
+              uint64_t dict = rd<uint64_t>(match + OFF_ENTITYDICT);
+              if (!dict) return toArray(env, out);
+
+              int count = rd<int32_t>(dict + OFF_DICT_COUNT);
+              uint64_t entries = rd<uint64_t>(dict + OFF_DICT_ENTRIES);
+              if (count <= 0 || count > 200 || !entries) return toArray(env, out);
+
+              for (int i = 0; i < count; i++) {
+                  uint64_t p = rd<uint64_t>(entries + (uint64_t) i * ENTRY_SIZE + ENTRY_KEY);
+                  if (!p || p == local) continue;
+
+                  float hp = rd<float>(p + OFF_HEALTH);
+                  if (hp <= 0.0f || hp > 1000.0f) continue;
+
+                  int team = rd<int32_t>(p + OFF_TEAM);
+                  float fx = rd<float>(p + OFF_POS);
+                  float fy = rd<float>(p + OFF_POS + 4);
+                  float fz = rd<float>(p + OFF_POS + 8);
+                  if (fx == 0.0f && fy == 0.0f && fz == 0.0f) continue;
+
+                  float sx, sy, hx, hy;
+                  if (!w2s(fx, fy, fz, sx, sy)) continue;
+                  if (!w2s(fx, fy + 1.65f, fz, hx, hy)) continue;
+
+                  float h = sy - hy;
+                  if (h < 4.0f || h > 900.0f) continue;
+                  float w = h * 0.55f;
+
+                  out.push_back(hx - w * 0.5f);
+                  out.push_back(hy);
+                  out.push_back(hx + w * 0.5f);
+                  out.push_back(sy);
+                  out.push_back(hp > 100.0f ? 1.0f : hp / 100.0f);
+                  out.push_back(sx);
+                  out.push_back(sy);
+                  out.push_back(team == myTeam ? 1.0f : 0.0f);
+              }
+
+              out[0] = (float) ((out.size() - 1) / 8);
+              return toArray(env, out);
+          }
+          EOF
+
+      - name: build
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmenu-apk
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 7
